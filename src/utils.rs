@@ -1,5 +1,6 @@
 use std::fmt;
 use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
 use std::str::Utf8Error;
 
@@ -43,7 +44,88 @@ pub fn slurp_file(file_name: String) -> Vec<u8> {
 }
 
 pub fn write_file(path: &Path, content: &[u8]) {
-    fs::write(path, content).unwrap_or_else(|_| panic!("Unable to write file {}", path.display()))
+    write_file_atomic(path, content)
+        .unwrap_or_else(|err| panic!("Unable to write file {}: {}", path.display(), err))
+}
+
+fn write_file_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() || !file_type.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "target exists and is a symlink or not a regular file",
+            ));
+        }
+    }
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid output path"))?;
+    let parent = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+
+    let mut temp_path = None;
+    for attempt in 0..100u32 {
+        let candidate = parent.join(format!(
+            ".{}.jwt-cli.{}.{}.tmp",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            attempt
+        ));
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => continue,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                temp_path = Some(candidate);
+                break;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let temp_path = temp_path.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not create a unique temporary file name",
+        )
+    })?;
+
+    let result = write_temp_and_replace(&temp_path, path, content);
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn write_temp_and_replace(temp_path: &Path, path: &Path, content: &[u8]) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut temp_file = options.open(temp_path)?;
+    temp_file.write_all(content)?;
+    temp_file.sync_all()?;
+    drop(temp_file);
+
+    replace_file(temp_path, path)
+}
+
+#[cfg(unix)]
+fn replace_file(temp_path: &Path, path: &Path) -> io::Result<()> {
+    fs::rename(temp_path, path)
+}
+
+#[cfg(not(unix))]
+fn replace_file(temp_path: &Path, path: &Path) -> io::Result<()> {
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    fs::rename(temp_path, path)
 }
 
 pub fn parse_duration_string(val: &str) -> Result<i64, String> {
@@ -177,6 +259,69 @@ fn parse_jwks(secret: &[u8]) -> Option<jwk::JwkSet> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempdir::TempDir;
+
+    #[test]
+    fn writes_file_atomically_with_owner_only_permissions() {
+        let dir = TempDir::new("jwt-write").unwrap();
+        let path = dir.path().join("token.jwt");
+
+        write_file_atomic(&path, b"secret-claims").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"secret-claims");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // no temporary files are left behind
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn overwrites_existing_regular_file() {
+        let dir = TempDir::new("jwt-write").unwrap();
+        let path = dir.path().join("token.jwt");
+        fs::write(&path, b"old").unwrap();
+
+        write_file_atomic(&path, b"new").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn refuses_symlink_target() {
+        let dir = TempDir::new("jwt-write").unwrap();
+        let real = dir.path().join("real.txt");
+        fs::write(&real, b"original").unwrap();
+        let link = dir.path().join("link.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&real, &link).unwrap();
+
+        assert!(write_file_atomic(&link, b"payload").is_err());
+        assert_eq!(fs::read(&real).unwrap(), b"original");
+    }
+
+    #[test]
+    fn refuses_non_regular_target() {
+        let dir = TempDir::new("jwt-write").unwrap();
+        let subdir = dir.path().join("subdir");
+        fs::create_dir(&subdir).unwrap();
+
+        assert!(write_file_atomic(&subdir, b"payload").is_err());
+    }
+
+    #[test]
+    fn leaves_no_temp_files_on_failure() {
+        let dir = TempDir::new("jwt-write").unwrap();
+        let path = dir.path().join("missing").join("token.jwt");
+
+        assert!(write_file_atomic(&path, b"payload").is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn parses_systemd_time_string() {
